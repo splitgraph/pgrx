@@ -11,7 +11,7 @@ use crate::{detect_pg_config, env_tracked, is_for_release};
 use bindgen::NonCopyUnionStyle;
 use bindgen::callbacks::{DeriveTrait, EnumVariantValue, ImplementsTrait, MacroParsingBehavior};
 use eyre::{WrapErr, eyre};
-use pgrx_pg_config::{PgConfig, PgMinorVersion, PgVersion, Pgrx};
+use pgrx_pg_config::{PgConfig, PgMinorVersion, PgVersion, Pgrx, SUPPORTED_VERSIONS};
 use quote::{ToTokens, quote};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -208,13 +208,43 @@ pub fn main() -> eyre::Result<()> {
     })?;
 
     if compile_cshim {
-        // compile the cshim for each binding
-        for (_version, pg_config) in pg_configs {
-            build_shim(&build_paths.shim_src, &build_paths.shim_dst, &pg_config)?;
-        }
+        let active_major_version = active_pg_major_version()?;
+        let pg_config = pg_configs
+            .iter()
+            .find(|(major_version, _)| *major_version == active_major_version)
+            .map(|(_, pg_config)| pg_config)
+            .ok_or_else(|| {
+                eyre!("could not find pg_config for active feature pg{active_major_version}")
+            })?;
+        build_shim(&build_paths.shim_src, &build_paths.shim_dst, pg_config)?;
     }
 
     Ok(())
+}
+
+fn active_pg_major_version() -> eyre::Result<u16> {
+    let found = SUPPORTED_VERSIONS()
+        .iter()
+        .filter_map(|pgver| {
+            env_tracked(&format!("CARGO_FEATURE_PG{}", pgver.major)).map(|_| pgver.major)
+        })
+        .collect::<Vec<_>>();
+
+    match &found[..] {
+        [major_version] => Ok(*major_version),
+        [] => Err(eyre!("did not find a pg$VERSION feature while compiling the cshim")),
+        versions => Err(eyre!(
+            "multiple pg$VERSION features found while compiling the cshim: {}",
+            versions.iter().map(|version| format!("pg{version}")).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+fn cshim_static_wrapper_name(major_version: u16) -> String {
+    // release builds generate bindings for every supported pg version in one OUT_DIR
+    // bindgen writes the static wrapper as a side file, so a shared name lets the
+    // last writer win and makes the cshim compile the wrong wrapper against this pg_config
+    format!("pgrx-cshim-static-pg{major_version}")
 }
 
 fn emit_rerun_if_changed() {
@@ -758,7 +788,7 @@ fn run_bindgen(
         .layout_tests(false)
         .default_non_copy_union_style(NonCopyUnionStyle::ManuallyDrop)
         .wrap_static_fns(enable_cshim)
-        .wrap_static_fns_path(out_path.join("pgrx-cshim-static"))
+        .wrap_static_fns_path(out_path.join(cshim_static_wrapper_name(major_version)))
         .wrap_static_fns_suffix("__pgrx_cshim")
         .generate()
         .wrap_err_with(|| format!("Unable to generate bindings for pg{major_version}"))?;
@@ -880,10 +910,14 @@ fn build_shim(
     pg_config: &PgConfig,
 ) -> eyre::Result<()> {
     let major_version = pg_config.major_version()?;
+    let generated_wrapper = format!("\"{}.c\"", cshim_static_wrapper_name(major_version));
 
     std::fs::copy(shim_src, shim_dst).unwrap();
 
     let mut build = cc::Build::new();
+    // pgrx-cshim.c includes the generated bindgen wrapper through this macro so
+    // each cshim build picks the wrapper that matches its postgres headers
+    build.define("PGRX_CSHIM_STATIC", Some(generated_wrapper.as_str()));
     let compiler = build.get_compiler();
     if compiler.is_like_gnu() || compiler.is_like_clang() {
         build.flag("-ffunction-sections");
